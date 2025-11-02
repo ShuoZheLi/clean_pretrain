@@ -1,5 +1,14 @@
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Make Hub calls more tolerant
+os.environ.setdefault("HF_HUB_READ_TIMEOUT", "60")        # default is 10
+os.environ.setdefault("HF_HUB_CONNECTION_TIMEOUT", "30")
+os.environ.setdefault("HF_HUB_HTTP_ERROR_RETRIES", "10")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")   # faster if hf_transfer installed
+# Optional: reduce metadata thread-fanout so we don't hammer a slow network
+os.environ.setdefault("HF_HUB_ENABLE_TELEMETRY", "0")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import time
 import json
 import random
@@ -98,6 +107,27 @@ def parse_args(args):
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--eps", type=float, default=1e-5)
 
+    # --- (re)init options ---
+    parser.add_argument(
+        "--reinit_params",
+         type=bool, 
+         default=False,
+        help="Reinitialize model parameters instead of using loaded weights."
+    )
+    parser.add_argument(
+        "--reinit_scope",
+        type=str,
+        default="all",
+        choices=["all", "lm_head", "embeddings"],
+        help="Which subset of params to reinitialize when --reinit_params is set."
+    )
+    parser.add_argument(
+        "--reinit_seed",
+        type=int,
+        default=None,
+        help="Optional seed used just before reinitialization for determinism."
+    )
+
     # GaLore parameters
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--update_proj_gap", type=int, default=50)
@@ -109,6 +139,9 @@ def parse_args(args):
 
     # training data parameters
     parser.add_argument("--dataset", type=str, default="allenai/c4")
+    # HF dataset config name (sometimes called "name" or language config). Use empty string for no config.
+    parser.add_argument("--dataset_config", type=str, default="en",
+                        help="Dataset configuration/name to pass to datasets.load_dataset (e.g. 'en' for C4). Use empty string for no config.")
 
 
     args = parser.parse_args(args)
@@ -123,9 +156,11 @@ def evaluate_model(args, model, preprocess_batched, pad_idx, global_rank, world_
     model.eval()
     try:
         _time = time.time()
-        val_data = datasets.load_dataset(args.dataset, "en", split="validation", streaming=True) #DGX
+        # If args.dataset_config is empty, pass None so load_dataset doesn't receive a config name
+        val_config = args.dataset_config or None
+        val_data = datasets.load_dataset(args.dataset, val_config, split="validation", streaming=True) #DGX
 
-        val_data = val_data.shuffle(seed=42)
+        val_data = val_data.shuffle(seed=args.seed)
         logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
         if not args.single_gpu:
@@ -202,6 +237,98 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
+
+def _default_module_init_(module, std=0.02):
+    # Conservative, HF-like defaults for Linear/Embedding/LayerNorm
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+    elif isinstance(module, nn.LayerNorm):
+        if module.weight is not None:
+            nn.init.ones_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def _reinit_linear_(linear, std):
+    nn.init.normal_(linear.weight, mean=0.0, std=std)
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
+def _reinit_embeddings_(emb, std):
+    nn.init.normal_(emb.weight, mean=0.0, std=std)
+
+
+def reinitialize_model_parameters(model, scope="all", seed=None):
+    """
+    Reinitialize HF model params.
+    scope: "all" | "lm_head" | "embeddings"
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+    # Try to respect the model's preferred init std if present
+    init_std = getattr(getattr(model, "config", None), "initializer_range", 0.02)
+
+    if scope == "all":
+        # Prefer the model's built-in init if available
+        if hasattr(model, "init_weights") and callable(getattr(model, "init_weights")):
+            try:
+                model.init_weights()
+                return
+            except Exception:
+                pass
+        if hasattr(model, "_init_weights") and callable(getattr(model, "_init_weights")):
+            try:
+                model.apply(lambda m: model._init_weights(m))  # type: ignore[attr-defined]
+                return
+            except Exception:
+                pass
+
+        model.apply(lambda m: _default_module_init_(m, std=init_std))
+
+        # Some models need this to ensure tied weights remain consistent
+        if hasattr(model, "tie_weights") and callable(getattr(model, "tie_weights")):
+            try:
+                model.tie_weights()
+            except Exception:
+                pass
+        return
+
+    if scope == "lm_head":
+        head = getattr(model, "lm_head", None)
+        if isinstance(head, nn.Linear):
+            _reinit_linear_(head, std=init_std)
+        # If the model ties embeddings & head, re-tie after touching the head
+        if hasattr(model, "tie_weights") and callable(getattr(model, "tie_weights")):
+            try:
+                model.tie_weights()
+            except Exception:
+                pass
+        return
+
+    if scope == "embeddings":
+        # input embeddings
+        emb_in = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+        if isinstance(emb_in, nn.Embedding):
+            _reinit_embeddings_(emb_in, std=init_std)
+        # output head sometimes acts as output embeddings; refresh + tie if applicable
+        head = getattr(model, "lm_head", None)
+        if isinstance(head, nn.Linear):
+            _reinit_linear_(head, std=init_std)
+        if hasattr(model, "tie_weights") and callable(getattr(model, "tie_weights")):
+            try:
+                model.tie_weights()
+            except Exception:
+                pass
+        return
+
 def dist_train_assert_check(args):
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
@@ -274,7 +401,8 @@ def tokenizer_data_loader(args, global_rank, world_size):
         )
         return batch
 
-    data = datasets.load_dataset(args.dataset, "en", split="train", streaming=True, trust_remote_code=True)
+    data_config = args.dataset_config or None
+    data = datasets.load_dataset(args.dataset, data_config, split="train", streaming=True, trust_remote_code=True)
     logger.info(f"Shuffling data with seed {args.seed}")
     data: datasets.Dataset = data.shuffle(seed=args.seed)
 
@@ -312,21 +440,25 @@ def load_model(args, device):
         )
         model_config = AutoConfig.from_pretrained(args.continue_from)
 
-        if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
+        if (not args.reinit_params) and os.path.exists(os.path.join(args.continue_from, "training_state.json")):
+            # Only load training state if we're *not* reinitializing
             logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
             with open(os.path.join(args.continue_from, "training_state.json")) as f:
                 _old_state = json.load(f)
-            global_step = _old_state["global_step"]
-            update_step = _old_state["update_step"]
-            tokens_seen = _old_state["tokens_seen"]
-            tokens_seen_before = _old_state["tokens_seen_before"]
+            global_step = _old_state.get("global_step", 0)
+            update_step = _old_state.get("update_step", 0)
+            tokens_seen = _old_state.get("tokens_seen", 0)
+            tokens_seen_before = _old_state.get("tokens_seen_before", 0)
             logger.info(f"global_step       : {global_step}")
             logger.info(f"update_step       : {update_step}")
             logger.info(f"tokens_seen       : {tokens_seen}")
             logger.info(f"tokens_seen_before: {tokens_seen_before}")
             logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
         else:
-            logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
+            if args.reinit_params:
+                logger.info("Ignoring saved training_state.* because --reinit_params is set (fresh training).")
+            else:
+                logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
         logger.info("*" * 40)
     else:
         model_config = AutoConfig.from_pretrained(args.model_config)
@@ -334,6 +466,14 @@ def load_model(args, device):
             model: HF_LlamaForCausalLM = AutoModelForCausalLM.from_config(model_config)
         else:
             model = AutoModelForCausalLM.from_config(model_config)
+
+    # >>> NEW: Reinitialize if requested (do this BEFORE moving to device/dtype for speed/clarity)
+    if args.reinit_params:
+        try:
+            logger.info(f"Reinitializing model parameters (scope='{args.reinit_scope}')")
+            reinitialize_model_parameters(model, scope=args.reinit_scope, seed=args.reinit_seed)
+        except Exception as e:
+            logger.warning(f"Reinitialization failed: {e}")
 
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
@@ -549,6 +689,15 @@ def main(args):
         model.resize_token_embeddings(len(tokenizer))
     except Exception as e:
         logger.warning(f"resize_token_embeddings call failed or unnecessary: {e}")
+
+    # If user requested embedding-only reinit, do it AFTER resize so shapes match and
+    # newly added tokens are initialized as well.
+    try:
+        if args.reinit_params and args.reinit_scope == "embeddings":
+            logger.info("Reinitializing embeddings after resize_token_embeddings")
+            reinitialize_model_parameters(model, scope="embeddings", seed=args.reinit_seed)
+    except Exception as e:
+        logger.warning(f"Reinitializing embeddings after resize failed: {e}")
 
     trainable_params, run_config, pbar = get_param_progress_bar(args, model, model_config, device, world_size, global_rank, update_step)
 
