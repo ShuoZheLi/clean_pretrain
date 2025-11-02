@@ -42,6 +42,99 @@ from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
 
 transformers.logging.set_verbosity_error()
 
+def save_model_and_tokenizer_checkpoint(
+    args,
+    model,
+    tokenizer,
+    run_config,
+    optimizer,
+    scheduler,
+    update_step,
+    global_step,
+    tokens_seen,
+    tokens_seen_before,
+    update_time,
+    layer_wise_flag=False,
+    optimizer_dict=None,
+    wandb_run=None,
+    skip_if_exists=False,
+):
+    """Save a checkpoint containing model, tokenizer, optimizer, and training state.
+
+    Creates a directory at f"{args.save_dir}/model_{update_step}" and writes:
+      - model weights/config via save_pretrained
+      - tokenizer files via tokenizer.save_pretrained
+      - optimizer.pt (optimizer + optional scheduler state)
+      - training_state.json (global/update steps, token counters, update time)
+      - wandb.json with run id (if available)
+
+    If skip_if_exists is True and the target directory exists, this is a no-op.
+    Returns the path of the checkpoint directory.
+    """
+    current_model_directory = f"{args.save_dir}/model_{update_step}"
+    if skip_if_exists and os.path.exists(current_model_directory):
+        return current_model_directory
+
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # Save model
+    getattr(model, "module", model).save_pretrained(current_model_directory, max_shard_size='100GB')
+
+    # Save tokenizer
+    try:
+        tokenizer.save_pretrained(current_model_directory)
+    except Exception as e:
+        logger.warning(f"Failed to save tokenizer: {e}")
+
+    # Save optimizer + scheduler state
+    try:
+        opt_state = (
+            optimizer.state_dict() if not layer_wise_flag else {id(k): v.state_dict() for k, v in (optimizer_dict or {}).items()}
+        )
+    except Exception:
+        opt_state = None
+
+    optimizer_checkpoint = {
+        "optimizer": opt_state,
+        "scheduler": None if scheduler is None else scheduler.state_dict(),
+        "update_step": update_step,
+        "global_step": global_step,
+        "config": run_config,
+        "wandb": getattr(wandb_run, "dir", None) if wandb_run is not None else (getattr(getattr(wandb, "run", None), "dir", None)),
+        "dtype": getattr(args, "dtype", None),
+    }
+    try:
+        torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+    except Exception as e:
+        logger.warning(f"Failed to save optimizer checkpoint: {e}")
+
+    # Save training state
+    training_state_checkpoint = {
+        "global_step": global_step,
+        "update_step": update_step,
+        "tokens_seen": tokens_seen,
+        "tokens_seen_before": tokens_seen_before,
+        "update_time": update_time,
+    }
+    try:
+        with open(f"{current_model_directory}/training_state.json", "w") as f:
+            json.dump(training_state_checkpoint, f, indent=4)
+    except Exception as e:
+        logger.warning(f"Failed to write training_state.json: {e}")
+
+    # Save wandb id at root save_dir for convenience
+    try:
+        _wandb_id = getattr(getattr(wandb_run, "run", None), "id", None)
+        if _wandb_id is None:
+            _wandb_id = getattr(getattr(wandb, "run", None), "id", None)
+        if _wandb_id is not None:
+            with open(f"{args.save_dir}/wandb.json", "w") as f:
+                json.dump({"wandb_id": _wandb_id}, f, indent=4)
+    except Exception:
+        pass
+
+    return current_model_directory
+
 @dataclass
 class ModelConfig:
     num_layers: int  # number of transformer layers (blocks)
@@ -417,8 +510,8 @@ def tokenizer_data_loader(args, global_rank, world_size):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=None,
-        num_workers=args.workers,
-        persistent_workers=False,
+        # num_workers=args.workers,
+        # persistent_workers=False,
     )
 
     return tokenizer, preprocess_batched, dataloader
@@ -728,6 +821,28 @@ def main(args):
     if 'galore' in args.optimizer.lower(): logger.info(f"Total params with GaLore enabled: {sum(p.numel() for p in galore_params) / 1_000_000:.2f}M")
     logger.info(f"Saving model to {args.save_dir} every {args.save_every} update steps")
 
+    # Save an initial checkpoint (model + tokenizer + optimizer state) before training starts
+    # so inference engines like vLLM can load directly from a checkpoint folder, and for easier debugging.
+    if global_rank == 0 and update_step == 0:
+        logger.info("Saving initial model/tokenizer/optimizer state (before training)")
+        save_model_and_tokenizer_checkpoint(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            run_config=run_config,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            update_step=update_step,
+            global_step=global_step,
+            tokens_seen=tokens_seen,
+            tokens_seen_before=tokens_seen_before,
+            update_time=0,
+            layer_wise_flag=layer_wise_flag,
+            optimizer_dict=optimizer_dict,
+            wandb_run=wandb_run,
+            skip_if_exists=True,
+        )
+
     # ##############################
     # TRAINING LOOP
     # we'll never go through all the data, so no need for epochs
@@ -795,38 +910,23 @@ def main(args):
         update_time = time.time() - update_time
         # save checkpoint by save_every
         if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-            current_model_directory = f"{args.save_dir}/model_{update_step}"
-            logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-            os.makedirs(args.save_dir, exist_ok=True)
-            getattr(model, "module", model).save_pretrained(current_model_directory, max_shard_size='100GB')
-
-            optimizer_checkpoint = {
-                "optimizer": optimizer.state_dict() if not layer_wise_flag else {id(k): v.state_dict() for k, v in optimizer_dict.items()},
-                "scheduler": None if scheduler is None else scheduler.state_dict(),
-                "update_step": update_step,
-                "global_step": global_step,
-                "config": run_config,
-                "wandb": wandb.run.dir,
-                "dtype": args.dtype,
-            }
-            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
-            training_state_checkpoint = {
-                "global_step": global_step,
-                "update_step": update_step,
-                "tokens_seen": tokens_seen,
-                "tokens_seen_before": tokens_seen_before,
-                "update_time": update_time,
-            }
-            with open(f"{current_model_directory}/training_state.json", "w") as f:
-                json.dump(training_state_checkpoint, f, indent=4)
-
-            # save wandb related info
-            wandb_info = {
-                "wandb_id": wandb.run.id,
-            }
-            with open(f"{args.save_dir}/wandb.json", "w") as f:
-                json.dump(wandb_info, f, indent=4)
+            logger.info(f"Saving checkpoint at update step {update_step}")
+            save_model_and_tokenizer_checkpoint(
+                args=args,
+                model=model,
+                tokenizer=tokenizer,
+                run_config=run_config,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                update_step=update_step,
+                global_step=global_step,
+                tokens_seen=tokens_seen,
+                tokens_seen_before=tokens_seen_before,
+                update_time=update_time,
+                layer_wise_flag=layer_wise_flag,
+                optimizer_dict=optimizer_dict,
+                wandb_run=wandb_run,
+            )
 
         # evaluation
         if update_step % args.eval_every == 0:
@@ -882,32 +982,25 @@ def main(args):
     logger.info("Training finished")
     if global_rank == 0: pbar.close()
 
-    current_model_directory = f"{args.save_dir}/model_{update_step}"
-    if global_rank == 0 and not os.path.exists(current_model_directory):
-        logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-        os.makedirs(args.save_dir, exist_ok=True)
-        getattr(model, "module", model).save_pretrained(current_model_directory, max_shard_size='100GB')
-
-        optimizer_checkpoint = {
-            "optimizer": optimizer.state_dict() if not layer_wise_flag else {id(k): v.state_dict() for k, v in optimizer_dict.items()},
-            "scheduler": None if scheduler is None else scheduler.state_dict(),
-            "update_step": update_step,
-            "global_step": global_step,
-            "config": run_config,
-            "wandb": wandb.run.dir,
-            "dtype": args.dtype,
-        }
-        torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
-        training_state_checkpoint = {
-            "global_step": global_step,
-            "update_step": update_step,
-            "tokens_seen": tokens_seen,
-            "tokens_seen_before": tokens_seen_before,
-            "update_time": update_time,
-        }
-        with open(f"{current_model_directory}/training_state.json", "w") as f:
-            json.dump(training_state_checkpoint, f, indent=4)
+    if global_rank == 0:
+        # Save final checkpoint if not already saved for this step
+        save_model_and_tokenizer_checkpoint(
+            args=args,
+            model=model,
+            tokenizer=tokenizer,
+            run_config=run_config,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            update_step=update_step,
+            global_step=global_step,
+            tokens_seen=tokens_seen,
+            tokens_seen_before=tokens_seen_before,
+            update_time=update_time,
+            layer_wise_flag=layer_wise_flag,
+            optimizer_dict=optimizer_dict,
+            wandb_run=wandb_run,
+            skip_if_exists=True,
+        )
 
     # Final evaluation
     logger.info("Running final evaluation")
