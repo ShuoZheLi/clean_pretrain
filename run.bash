@@ -34,9 +34,10 @@ activation_checkpointing=True
 
 # model
 model_config="/nfs/shuozhe/saved_model/Qwen2.5-0.5B"
-# dataset="allenai/c4"
-dataset="/nfs/shuozhe/saved_dataset/small-c4-dataset"
-dataset_config="default"  # use None for no config
+dataset="allenai/c4"
+dataset_config="en"
+# dataset="/nfs/shuozhe/saved_dataset/small-c4-dataset"
+# dataset_config="default"  # use None for no config
 
 # log and eval
 project_name="pretrain_test"
