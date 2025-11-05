@@ -16,6 +16,7 @@ scheduler="cosine"
 warmup_steps=1000
 num_training_steps=4_00_00
 # max_train_tokens=1000000000
+max_length=256
 
 # training parameters
 
@@ -65,6 +66,7 @@ torchrun --standalone --nproc_per_node $nproc_per_node pretrain.py \
         --continue_from $continue_from \
         --batch_size $batch_size \
         --total_batch_size $total_batch_size \
+        --max_length $max_length \
         --activation_checkpointing $activation_checkpointing \
         --gradient_accumulation $gradient_accumulation \
         --save_dir $save_dir \
