@@ -14,6 +14,7 @@ import json
 import random
 import argparse
 import numpy as np
+import math
 
 import torch
 import torch.nn as nn
@@ -88,9 +89,28 @@ def save_model_and_tokenizer_checkpoint(
 
     # Save optimizer + scheduler state
     try:
-        opt_state = (
-            optimizer.state_dict() if not layer_wise_flag else {id(k): v.state_dict() for k, v in (optimizer_dict or {}).items()}
-        )
+        if not layer_wise_flag:
+            opt_state = optimizer.state_dict()
+        else:
+            # Build a stable mapping from parameter *names* -> optimizer state_dict
+            # Use the module's named_parameters() to find parameter names. If a name
+            # cannot be found for a parameter object, fall back to its id (for
+            # backward compatibility with older checkpoints).
+            opt_state = {}
+            base_model = getattr(model, "module", model)
+            name_by_id = {id(p): n for n, p in base_model.named_parameters()}
+            for p_obj, opt_obj in (optimizer_dict or {}).items():
+                p_id = id(p_obj)
+                name = name_by_id.get(p_id)
+                try:
+                    state = opt_obj.state_dict()
+                except Exception:
+                    state = None
+                if name is not None:
+                    opt_state[name] = state
+                else:
+                    # fallback to id-based key for compatibility
+                    opt_state[str(p_id)] = state
     except Exception:
         opt_state = None
 
@@ -100,15 +120,18 @@ def save_model_and_tokenizer_checkpoint(
         "update_step": update_step,
         "global_step": global_step,
         "config": run_config,
-        "wandb": getattr(wandb_run, "dir", None) if wandb_run is not None else (getattr(getattr(wandb, "run", None), "dir", None)),
+        "wandb": getattr(wandb_run, "dir", None) if wandb_run is not None else getattr(getattr(wandb, "run", None), "dir", None),
         "dtype": getattr(args, "dtype", None),
     }
     try:
-        torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+        tmp_opt = f"{current_model_directory}/optimizer.pt.tmp"
+        os.makedirs(current_model_directory, exist_ok=True)
+        torch.save(optimizer_checkpoint, tmp_opt)
+        os.replace(tmp_opt, f"{current_model_directory}/optimizer.pt")
     except Exception as e:
         logger.warning(f"Failed to save optimizer checkpoint: {e}")
 
-    # Save training state
+    # Save training state (small JSON) and optional RNG sidecar (binary)
     training_state_checkpoint = {
         "global_step": global_step,
         "update_step": update_step,
@@ -117,16 +140,33 @@ def save_model_and_tokenizer_checkpoint(
         "update_time": update_time,
     }
     try:
-        with open(f"{current_model_directory}/training_state.json", "w") as f:
+        tmp_ts = f"{current_model_directory}/training_state.json.tmp"
+        os.makedirs(current_model_directory, exist_ok=True)
+        with open(tmp_ts, "w") as f:
             json.dump(training_state_checkpoint, f, indent=4)
+        os.replace(tmp_ts, f"{current_model_directory}/training_state.json")
     except Exception as e:
         logger.warning(f"Failed to write training_state.json: {e}")
 
+    # Optionally save RNG state as a compact binary sidecar for faster IO
+    try:
+        if getattr(args, "restore_rng", False):
+            rng_state = {
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+            }
+            tmp_rng = f"{current_model_directory}/rng_state.pt.tmp"
+            torch.save(rng_state, tmp_rng)
+            os.replace(tmp_rng, f"{current_model_directory}/rng_state.pt")
+    except Exception as e:
+        # Non-critical: RNG save failure shouldn't block checkpointing
+        logger.warning(f"Failed to write rng_state sidecar: {e}")
+
     # Save wandb id at root save_dir for convenience
     try:
-        _wandb_id = getattr(getattr(wandb_run, "run", None), "id", None)
-        if _wandb_id is None:
-            _wandb_id = getattr(getattr(wandb, "run", None), "id", None)
+        _wandb_id = getattr(wandb_run, "id", None) if wandb_run is not None else getattr(getattr(wandb, "run", None), "id", None)
         if _wandb_id is not None:
             with open(f"{args.save_dir}/wandb.json", "w") as f:
                 json.dump({"wandb_id": _wandb_id}, f, indent=4)
@@ -157,9 +197,30 @@ class ModelConfig:
 def parse_args(args):
     parser = argparse.ArgumentParser()
 
+    def int_or_none(x):
+        return None if x.lower() == "none" else int(x)
+    
+    def str2bool(x):
+        """Parse a string/bool-like value into a proper boolean.
+
+        Accepts: 1/0, true/false, t/f, yes/no, y/n (case-insensitive).
+        This avoids argparse's "type=bool" pitfall where non-empty strings are True.
+        """
+        if isinstance(x, bool):
+            return x
+        s = str(x).strip().lower()
+        return s in {"1", "true", "t", "yes", "y"}
+
+    def str_or_none(x: str | None):
+        if x is None:
+            return None
+        s = str(x).strip().lower()
+        return None if s in {"", "none", "null"} else x
+
+    # --- model / training ---
     parser.add_argument("--model_config", type=str, default="meta-llama/Llama-2-7b", required=True)
     parser.add_argument("--use_hf_model", default=False, action="store_true")
-    parser.add_argument("--continue_from", type=str, default=None)
+    parser.add_argument("--continue_from", type=str_or_none, default=None)
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
     parser.add_argument("--total_batch_size", type=int, default=None)
@@ -168,20 +229,32 @@ def parse_args(args):
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
-    parser.add_argument("--activation_checkpointing", type=bool, default=False)
+    parser.add_argument("--activation_checkpointing", type=str2bool, default=False)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
     parser.add_argument("--eval_every", type=int, default=5_000)
-    parser.add_argument("--num_training_steps", type=int, default=10_000,
-                        help="Number of **update steps** to train for. "
-                             "Notice that gradient accumulation is taken into account.")
+
+    # primary stop condition (kept for backward compatibility)
+    parser.add_argument("--num_training_steps", type=int_or_none, default=None,
+                        help="Number of **update steps** to train for. Gradient accumulation is already accounted for.")
     parser.add_argument("--max_train_tokens", type=training_utils.max_train_tokens_to_number, default=None,
-                        help="Number of tokens to train on. Overwrites num_training_steps. "
-                             "You can use M and B suffixes, e.g. 100M or 1B.")
+                        help="Train until this many tokens are seen (overrides num_training_steps). Suffixes M/B accepted.")
+
+    # NEW: epoch-style controls
+    parser.add_argument("--num_epochs", type=int, default=None,
+                        help="(Non-streaming only) Train for this many true epochs over the dataset.")
+    parser.add_argument("--tokens_per_epoch", type=training_utils.max_train_tokens_to_number, default=None,
+                        help="(Streaming or non-streaming) Define a virtual epoch by this many seen tokens.")
+    parser.add_argument("--eval_each_epoch", action="store_true", default=False,
+                        help="Run eval whenever a (true/virtual) epoch boundary is reached.")
+    parser.add_argument("--save_each_epoch", action="store_true", default=False,
+                        help="Save a checkpoint whenever a (true/virtual) epoch boundary is reached.")
+
     parser.add_argument("--save_every", type=int, default=10_000)
-    parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--tags", type=str, default=None)
-    # W&B related args
+
+    # W&B
     parser.add_argument("--project_name", type=str, default="llm-pretraining")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
@@ -193,52 +266,49 @@ def parse_args(args):
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--restore_rng", type=str2bool, default=True,
+                        help="If set, save and restore RNG states (torch/cuda/numpy) when checkpointing")
     parser.add_argument("--name", type=str, default="test")
     parser.add_argument("--grad_clipping", type=float, default=0.0)
-    # beta1 for adafactor and beta2 for adamW
-    parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.95)
+    parser.add_argument("--beta1", type=float, default=0.9)   # adafactor beta1 or sgd momentum
+    parser.add_argument("--beta2", type=float, default=0.95)  # adamW beta2
     parser.add_argument("--eps", type=float, default=1e-5)
 
-    # --- (re)init options ---
-    parser.add_argument(
-        "--reinit_params",
-         type=bool, 
-         default=False,
-        help="Reinitialize model parameters instead of using loaded weights."
-    )
-    parser.add_argument(
-        "--reinit_scope",
-        type=str,
-        default="all",
-        choices=["all", "lm_head", "embeddings"],
-        help="Which subset of params to reinitialize when --reinit_params is set."
-    )
-    parser.add_argument(
-        "--reinit_seed",
-        type=int,
-        default=None,
-        help="Optional seed used just before reinitialization for determinism."
-    )
+    # (re)init options
+    parser.add_argument("--reinit_params", type=str2bool, default=False)
+    parser.add_argument("--reinit_scope", type=str, default="all", choices=["all", "lm_head", "embeddings"])
+    parser.add_argument("--reinit_seed", type=int, default=None)
 
-    # GaLore parameters
+    # GaLore
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--update_proj_gap", type=int, default=50)
     parser.add_argument("--galore_scale", type=float, default=1.0)
     parser.add_argument("--proj_type", type=str, default="std")
 
-    # disable ddp, single_gpu
+    # runtime
     parser.add_argument("--single_gpu", default=False, action="store_true")
 
-    # training data parameters
+    # --- DATA OPTIONS ---
+    # HF remote dataset (default)
     parser.add_argument("--dataset", type=str, default="allenai/c4")
-    # HF dataset config name (sometimes called "name" or language config). Use empty string for no config.
     parser.add_argument("--dataset_config", type=str, default="en",
-                        help="Dataset configuration/name to pass to datasets.load_dataset (e.g. 'en' for C4). Use empty string for no config.")
+                        help="Config/name for datasets.load_dataset. Use empty string for none.")
 
+    # NEW: local finite dataset support (true epochs)
+    parser.add_argument("--streaming", dest="streaming", action="store_true", default=True,
+                        help="Use streaming=True (infinite/unknown length).")
+    parser.add_argument("--no-streaming", dest="streaming", action="store_false",
+                        help="Use non-streaming finite datasets (true epochs).")
+    parser.add_argument("--dataset_local_path", type=str, default=None,
+                        help="Path to a datasets *load_from_disk* dataset directory for local loading.")
+    parser.add_argument("--train_split", type=str, default="train",
+                        help="Train split name when using non-streaming datasets.")
+    parser.add_argument("--val_split", type=str, default="validation",
+                        help="Validation split name when using non-streaming or local datasets.")
+    parser.add_argument("--text_column", type=str, default="text",
+                        help="Name of the text field when mapping/tokenizing non-streaming datasets.")
 
     args = parser.parse_args(args)
-
     args = args_utils.check_args_torchrun_main(args)
     return args
 
@@ -249,34 +319,89 @@ def evaluate_model(args, model, preprocess_batched, pad_idx, global_rank, world_
     model.eval()
     try:
         _time = time.time()
-        # If args.dataset_config is empty, pass None so load_dataset doesn't receive a config name
-        val_config = args.dataset_config or None
-        val_data = datasets.load_dataset(args.dataset, val_config, split="validation", streaming=True) #DGX
 
-        val_data = val_data.shuffle(seed=args.seed)
+        if args.streaming:
+            val_config = args.dataset_config or None
+            val_data = datasets.load_dataset(args.dataset, val_config, split="validation", streaming=True, trust_remote_code=True)
+            val_data = val_data.shuffle(seed=args.seed)
+            # If distributed, split by node first, then create a mapped iterable
+            if not args.single_gpu:
+                val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
+
+            # Make remove_columns robust by intersecting with present features
+            present = set(getattr(val_data, "features", {}) or [])
+            to_remove = {"text", "timestamp", "url"} if args.text_column == "text" else {args.text_column}
+            remove_cols = list(present.intersection(to_remove))
+
+            # Always map the streaming dataset (single-gpu or distributed) so downstream code
+            # can uniformly use val_data_mapped.batch(...)
+            val_data_mapped = val_data.map(
+                preprocess_batched,
+                batched=True,
+                remove_columns=remove_cols,
+            )
+
+            # batch() helper for streaming
+            # Call the helper directly instead of monkey-patching an attribute that
+            # may be invoked with keyword args. This avoids lambdas that only accept
+            # a positional parameter and prevents TypeError when called with
+            # batch_size=... elsewhere.
+            iterator = training_utils.batch_fn(val_data_mapped, batch_size)
+
+        else:
+            # non-streaming: finite dataset
+            if args.dataset_local_path is not None:
+                ds = datasets.load_from_disk(args.dataset_local_path)
+            else:
+                ds = datasets.load_dataset(args.dataset, args.dataset_config or None, split=None, streaming=False, trust_remote_code=True)
+
+            if isinstance(ds, dict):
+                if args.val_split in ds:
+                    val_raw = ds[args.val_split]
+                elif args.train_split in ds:
+                    # fallback: small slice of train
+                    n = min(10_000, len(ds[args.train_split]))
+                    val_raw = ds[args.train_split].select(range(n))
+                else:
+                    raise ValueError("Validation split not found and no train split to sample from.")
+            else:
+                # if user directly passed split=... earlier, ds is a Dataset
+                val_raw = ds
+
+            # tokenize + keep only model inputs
+            # Reuse the tokenizer/preprocess function created for training (do not recreate a new tokenizer per batch)
+            # Compute remove_columns robustly to avoid depending on any fixed dataset schema
+            present = set(getattr(val_raw, "features", {}) or [])
+            remove_cols = list(present.difference({args.text_column}))
+            val_tok = val_raw.map(
+                lambda batch: preprocess_batched(batch),
+                batched=True,
+                remove_columns=remove_cols,
+            )
+            val_tok.set_format(type="torch", columns=["input_ids", "attention_mask"])
+
+            if not args.single_gpu:
+                sampler = torch.utils.data.distributed.DistributedSampler(val_tok, shuffle=False)
+            else:
+                sampler = None
+
+            iterator = torch.utils.data.DataLoader(
+                val_tok, batch_size=batch_size, sampler=sampler, shuffle=False, num_workers=min(4, args.workers), pin_memory=True
+            )
+
         logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
-        if not args.single_gpu:
-            val_data = datasets.distributed.split_dataset_by_node(val_data, rank=global_rank, world_size=world_size)
-
-        val_data_mapped = val_data.map(
-            preprocess_batched,
-            batched=True,
-            remove_columns=["text", "timestamp", "url"],
-        )
-        val_data_mapped.batch = lambda batch_size: training_utils.batch_fn(val_data_mapped, batch_size)
         target_eval_tokens = 4096
         evaluated_on_tokens = 0
-        total_loss = torch.tensor(0.0).to(device)
-        # start from 0 so averaging isn't biased; guard division by zero below
+        total_loss = torch.tensor(0.0, device=device)
         total_batches = 0
-        logger.info(f"Eval set prepared in {time.time() - _time:.2f} seconds")
 
-        for batch in val_data_mapped.batch(batch_size=batch_size):
+        for batch in iterator:
             if evaluated_on_tokens > target_eval_tokens:
                 break
             total_batches += 1
 
+            # streaming iterator yields dict of tensors already; map-style yields dict from DataLoader
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()
             labels[labels == pad_idx] = -100
@@ -287,7 +412,7 @@ def evaluate_model(args, model, preprocess_batched, pad_idx, global_rank, world_
 
         total_loss = total_loss / max(1, total_batches)
 
-        # Gather losses across all GPUs when distributed
+        # reduce across ranks
         gathered_losses = [torch.zeros_like(total_loss) for _ in range(world_size)]
         if (not args.single_gpu) and dist.is_available() and dist.is_initialized() and world_size > 1:
             dist.all_gather(gathered_losses, total_loss)
@@ -422,6 +547,24 @@ def reinitialize_model_parameters(model, scope="all", seed=None):
                 pass
         return
 
+
+def ddp_token_weighted_avg(sum_loss_local, sum_tokens_local, device, single_gpu):
+    """Return the token-weighted average loss across DDP ranks.
+
+    sum_loss_local: scalar (float) - sum of per-example losses weighted by token count on this rank
+    sum_tokens_local: scalar (float) - total non-pad tokens on this rank
+    device: device string (e.g., 'cuda:0') used to create reduction tensor
+    single_gpu: bool, if True no distributed reduce is performed
+    """
+    vec = torch.tensor(
+        [float(sum_loss_local), float(sum_tokens_local)],
+        device=device, dtype=torch.float32
+    )
+    if (not single_gpu) and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    sum_loss_all, sum_tokens_all = vec[0].item(), max(1.0, vec[1].item())
+    return sum_loss_all / sum_tokens_all
+
 def dist_train_assert_check(args):
 
     assert "LOCAL_RANK" in os.environ, "torchrun should set LOCAL_RANK"
@@ -474,47 +617,72 @@ def init_runtime(args):
         return dist_train_assert_check(args)
 
 def tokenizer_data_loader(args, global_rank, world_size):
-
-    # it doesn't matter which tokenizer we use, because we train from scratch
-    # T5 tokenizer was trained on C4 and we are also training on C4, so it's a good choice
     tokenizer = AutoTokenizer.from_pretrained(args.model_config, model_max_length=args.max_length)
-
-    # tokenizer.pad_token = "[PAD]"
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<|reserved_special_token_0|>"})
     tokenizer.padding_side = "right"
 
     def preprocess_batched(batch):
-        batch = tokenizer(
-            batch["text"],
+        return tokenizer(
+            batch[args.text_column] if args.text_column in batch else batch["text"],
             max_length=args.max_length,
             truncation=True,
             padding="max_length",
             return_tensors="pt",
         )
-        return batch
 
-    data_config = args.dataset_config or None
-    data = datasets.load_dataset(args.dataset, data_config, split="train", streaming=True, trust_remote_code=True)
-    logger.info(f"Shuffling data with seed {args.seed}")
-    data: datasets.Dataset = data.shuffle(seed=args.seed)
+    if args.streaming:
+        data_config = args.dataset_config or None
+        data = datasets.load_dataset(args.dataset, data_config, split="train", streaming=True, trust_remote_code=True)
+        logger.info(f"Shuffling data with seed {args.seed}")
+        data = data.shuffle(seed=args.seed)
 
-    # split the dataset by node
-    if not args.single_gpu:
-        data = datasets.distributed.split_dataset_by_node(
-            data, rank=global_rank, world_size=world_size,
-        )
-    dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
-    # For IterableDataset / streaming, persistent_workers can cause workers to hang or keep stale streams.
-    # Disable persistent_workers for streaming workloads and let the user control num_workers via --workers.
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=None,
-        # num_workers=args.workers,
-        # persistent_workers=False,
+        if not args.single_gpu:
+            data = datasets.distributed.split_dataset_by_node(data, rank=global_rank, world_size=world_size)
+
+        dataset = PreprocessedIterableDataset(data, tokenizer, batch_size=args.batch_size, max_length=args.max_length)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
+        train_num_examples = None  # unknown
+        return tokenizer, preprocess_batched, dataloader, train_num_examples
+
+    # ---- Non-streaming: finite dataset (true epochs) ----
+    if args.dataset_local_path is not None:
+        ds = datasets.load_from_disk(args.dataset_local_path)
+    else:
+        ds = datasets.load_dataset(args.dataset, args.dataset_config or None, split=None, streaming=False, trust_remote_code=True)
+
+    if isinstance(ds, dict):
+        if args.train_split not in ds:
+            raise ValueError(f"train split '{args.train_split}' not found in dataset")
+        train_raw = ds[args.train_split]
+    else:
+        train_raw = ds  # user passed a concrete split elsewhere
+
+    train_tok = train_raw.map(
+        lambda batch: tokenizer(
+            batch[args.text_column], max_length=args.max_length, truncation=True, padding="max_length"
+        ),
+        batched=True,
+        remove_columns=[c for c in train_raw.column_names if c != args.text_column],
     )
+    train_tok.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
-    return tokenizer, preprocess_batched, dataloader
+    if not args.single_gpu:
+        sampler = torch.utils.data.distributed.DistributedSampler(train_tok, shuffle=True)
+    else:
+        sampler = None
+
+    dataloader = torch.utils.data.DataLoader(
+        train_tok,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=args.workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    train_num_examples = len(train_tok)
+    return tokenizer, preprocess_batched, dataloader, train_num_examples
 
 def load_model(args, device):
 
@@ -523,6 +691,7 @@ def load_model(args, device):
     beginning_step = 0
     tokens_seen = 0
     tokens_seen_before = 0
+    update_time = 0
 
     if args.continue_from is not None:
         logger.info("*" * 40)
@@ -542,11 +711,37 @@ def load_model(args, device):
             update_step = _old_state.get("update_step", 0)
             tokens_seen = _old_state.get("tokens_seen", 0)
             tokens_seen_before = _old_state.get("tokens_seen_before", 0)
+            # restore update_time from checkpoint so we can keep throughput calcs continuous
+            update_time = _old_state.get("update_time", 0)
             logger.info(f"global_step       : {global_step}")
             logger.info(f"update_step       : {update_step}")
             logger.info(f"tokens_seen       : {tokens_seen}")
             logger.info(f"tokens_seen_before: {tokens_seen_before}")
             logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+            # Clear resume summary message for human readability
+            logger.info(f"Resuming training from update_step={update_step}, global_step={global_step}")
+            # Optionally restore RNGs (torch/cuda/numpy) if present and requested
+            try:
+                if getattr(args, "restore_rng", False):
+                    if "torch_rng_state" in _old_state:
+                        try:
+                            torch.set_rng_state(torch.tensor(_old_state["torch_rng_state"], dtype=torch.uint8))
+                        except Exception:
+                            pass
+                    if torch.cuda.is_available() and _old_state.get("cuda_rng_state") is not None:
+                        try:
+                            for i, s in enumerate(_old_state.get("cuda_rng_state", [])):
+                                torch.cuda.set_rng_state(torch.tensor(s, dtype=torch.uint8), device=i)
+                        except Exception:
+                            pass
+                    if _old_state.get("numpy_rng_state") is not None:
+                        try:
+                            np_state = _old_state["numpy_rng_state"]
+                            np.random.set_state((np_state.get("name"), np.array(np_state.get("state"), dtype=np.int64), int(np_state.get("pos"))))
+                        except Exception:
+                            pass
+            except Exception:
+                logger.warning("Failed to restore RNG state from checkpoint (continuing without restoring RNGs)")
         else:
             if args.reinit_params:
                 logger.info("Ignoring saved training_state.* because --reinit_params is set (fresh training).")
@@ -576,7 +771,7 @@ def load_model(args, device):
     else:
         model = model.to(device=device)
 
-    return model, model_config, global_step, update_step, beginning_step, tokens_seen, tokens_seen_before
+    return model, model_config, global_step, update_step, beginning_step, tokens_seen, tokens_seen_before, update_time
 
 def get_param_progress_bar(args, model, model_config, device, world_size, global_rank, update_step):
     n_total_params = sum(p.numel() for p in model.parameters())
@@ -597,7 +792,18 @@ def get_param_progress_bar(args, model, model_config, device, world_size, global
     if global_rank == 0:
         # fix tqdm visual length to 80 so that the progress bar
         # doesn't jump around when changing from external display to laptop
-        pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
+        # Show absolute update steps and start the bar at the restored update_step
+        # so the UI matches the resumed training state.
+        try:
+            pbar = tqdm(
+                total=args.num_training_steps,
+                initial=update_step,
+                desc="Update steps",
+                ncols=80,
+            )
+        except Exception:
+            # Fall back to previous behavior if something unexpected occurs
+            pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
     return trainable_params, run_config, pbar
 
@@ -610,6 +816,10 @@ def init_wandb_once(args, run_config, global_rank):
 
     tags = [t.strip() for t in args.tags.split(",")] if args.tags else None
 
+    # Choose resume behavior: if a wandb_id was provided we must attach to the
+    # same run (fail-fast if it doesn't exist). Otherwise allow creating a new run.
+    _resume = "must" if args.wandb_id else "allow"
+
     run = wandb.init(
         project=args.project_name,
         entity=args.wandb_entity,
@@ -621,7 +831,7 @@ def init_wandb_once(args, run_config, global_rank):
         tags=tags,
         config=run_config,
         id=args.wandb_id,
-        resume="allow",
+        resume=_resume,
         settings=wandb.Settings(code_dir="."),
     )
 
@@ -632,6 +842,13 @@ def init_wandb_once(args, run_config, global_rank):
         wandb.define_metric("eval/*", step_metric="update_step")
     except Exception:
         # Older wandb versions may not have define_metric; ignore if it fails
+        pass
+
+    # If we resumed an existing run, allow config values to be updated without errors
+    try:
+        if args.wandb_id:
+            wandb.config.update(run_config, allow_val_change=True)
+    except Exception:
         pass
 
     return run
@@ -775,8 +992,8 @@ def main(args):
     # How often to push logs to wandb (1 = every update). Increasing this reduces stdout noise.
     LOG_EVERY = 1
     check_train_assertions(args, world_size)
-    tokenizer, preprocess_batched, dataloader = tokenizer_data_loader(args, global_rank, world_size)
-    model, model_config, global_step, update_step, beginning_step, tokens_seen, tokens_seen_before = load_model(args, device)
+    tokenizer, preprocess_batched, dataloader, train_num_examples = tokenizer_data_loader(args, global_rank, world_size)
+    model, model_config, global_step, update_step, beginning_step, tokens_seen, tokens_seen_before, saved_update_time = load_model(args, device)
     # Ensure model embeddings match tokenizer vocabulary if we added a pad token
     try:
         model.resize_token_embeddings(len(tokenizer))
@@ -792,12 +1009,216 @@ def main(args):
     except Exception as e:
         logger.warning(f"Reinitializing embeddings after resize failed: {e}")
 
+    # --- Derive an effective num_training_steps for scheduler/pbar ---
+    # Priority order:
+    # 1) max_train_tokens (if given) -> converted to steps online (no change here; we keep your existing logic)
+    # 2) Non-streaming + num_epochs (true epochs) -> compute updates from dataset size
+    # 3) Otherwise, use user-provided num_training_steps
+    if (not args.streaming) and (args.num_epochs is not None) and (train_num_examples is not None):
+        per_update_examples = args.batch_size * args.gradient_accumulation * world_size
+        updates_per_epoch = math.ceil(train_num_examples / max(1, per_update_examples))
+        args.num_training_steps = updates_per_epoch * args.num_epochs
+        logger.info(f"[epochs] train examples={train_num_examples}, per_update_examples={per_update_examples}, "
+                    f"updates/epoch={updates_per_epoch}, total updates={args.num_training_steps}")
+
+    # If max_train_tokens is provided, derive num_training_steps from token cap so pbar/scheduler reflect token-based stopping
+    if args.max_train_tokens is not None:
+        per_update_tokens = args.max_length * args.batch_size * args.gradient_accumulation * world_size
+        per_update_tokens = max(1, per_update_tokens)
+        args.num_training_steps = math.ceil(args.max_train_tokens / per_update_tokens)
+        logger.info(f"[tokens cap] per_update_tokens≈{per_update_tokens}, derived total updates={args.num_training_steps}")
+
+    # If user requested resume but there's no training_state.json, warn that progress bar/counts will restart
+    if args.continue_from and not os.path.exists(os.path.join(args.continue_from, "training_state.json")):
+        logger.warning("No training_state.json found in continue_from; progress bar and update_step will start from 0 unless training_state.json is present.")
+
     trainable_params, run_config, pbar = get_param_progress_bar(args, model, model_config, device, world_size, global_rank, update_step)
+
+    # Log the final planned number of update steps (after any recomputation)
+    if global_rank == 0:
+        logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+
+    # Convenience: if continuing from a checkpoint and the user didn't pass a
+    # wandb run id, prefer to auto-load wandb.json from the checkpoint dir.
+    if args.wandb_id is None and args.continue_from:
+        wandb_hint = os.path.join(args.continue_from, "wandb.json")
+        if os.path.exists(wandb_hint):
+            try:
+                with open(wandb_hint, "r") as _f:
+                    w = json.load(_f)
+                    if isinstance(w, dict) and w.get("wandb_id"):
+                        args.wandb_id = w.get("wandb_id")
+                        logger.info(f"Auto-loaded wandb_id from {wandb_hint}")
+            except Exception:
+                pass
+
+# ----- NEW: force resume behavior via env (harmless if already set) -----
+    if args.wandb_id:
+        # require attaching to the same run id; fail-fast if the id does not exist
+        os.environ.setdefault("WANDB_RESUME", "must")
+        os.environ.setdefault("WANDB_RUN_ID", args.wandb_id)
+    else:
+        # allow creating a fresh run when no id provided
+        os.environ.setdefault("WANDB_RESUME", "allow")
+
+    # Streaming resume note
+    if args.streaming and args.continue_from:
+        logger.info("Streaming mode: resuming counters but not exact data position.")
 
     # Initialize W&B once (rank 0). We pass the full run_config here.
     wandb_run = init_wandb_once(args, run_config, global_rank)
 
+    # Optional: log a tiny resume marker so the UI shows where a resume occurred
+    try:
+        if global_rank == 0 and args.continue_from and update_step > 0 and wandb_run is not None:
+            wandb.log({"system/resumed": 1}, step=update_step)
+    except Exception:
+        pass
+
     optimizer, layer_wise_flag, optimizer_dict, galore_params, scheduler = load_optimizer(args, model, trainable_params)
+
+    # --- Broadcast model params from rank 0 to ensure exact same weights on resume in DDP setups ---
+    if (not args.single_gpu) and dist.is_available() and dist.is_initialized():
+        try:
+            if global_rank == 0:
+                logger.info("Broadcasting model parameters from rank 0 to all ranks to ensure parity on resume")
+            for param in model.parameters():
+                dist.broadcast(param.data, src=0)
+        except Exception as e:
+            logger.warning(f"Model parameter broadcast failed: {e}")
+
+    # --- Resume optimizer/scheduler if continuing ---
+    if args.continue_from is not None:
+        ckpt_path = os.path.join(args.continue_from, "optimizer.pt")
+        if os.path.exists(ckpt_path):
+            try:
+                logger.info(f"Loading optimizer/scheduler state from {ckpt_path}")
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                scheduler_loaded = False
+
+                # Config/schedule drift check
+                try:
+                    saved_cfg = ckpt.get("config", {}) or {}
+                    if saved_cfg:
+                        diffs = []
+                        for k in ["scheduler", "num_training_steps", "warmup_steps", "min_lr_ratio", "max_lr"]:
+                            saved_val = str(saved_cfg.get(k))
+                            if k == "max_lr":
+                                curr_val = str(run_config.get("max_lr"))
+                            else:
+                                curr_val = str(getattr(args, k, None))
+                            if saved_val != "None" and saved_val != curr_val:
+                                diffs.append(k)
+                        if diffs:
+                            logger.warning(f"Resume config differs for: {', '.join(diffs)}. Learning-rate schedule shape may change.")
+                except Exception:
+                    pass
+
+                if not layer_wise_flag:
+                    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
+                        try:
+                            optimizer.load_state_dict(ckpt["optimizer"])
+                        except Exception as e:
+                            logger.warning(f"Could not load optimizer state_dict (non-layerwise): {e}")
+                else:
+                    # ckpt["optimizer"] expected to be a dict keyed by parameter name (preferred)
+                    if "optimizer" in ckpt and isinstance(ckpt["optimizer"], dict):
+                        base_model = getattr(model, "module", model)
+                        name_to_param = dict(base_model.named_parameters())
+                        for k, state in ckpt["optimizer"].items():
+                            # If the key is numeric (old style), fall back to id-based matching
+                            if isinstance(k, str) and k.isdigit():
+                                try:
+                                    k_int = int(k)
+                                except Exception:
+                                    continue
+                                for p_obj, opt_obj in optimizer_dict.items():
+                                    if id(p_obj) == k_int:
+                                        try:
+                                            opt_obj.load_state_dict(state)
+                                        except Exception:
+                                            logger.warning(f"Failed loading layer-wise optimizer state for param id {k_int}")
+                                        break
+                                continue
+
+                            # Prefer name-based matching
+                            p = name_to_param.get(k)
+                            if p is None:
+                                logger.warning(f"Param {k} missing in current model; skipping its optimizer state")
+                                continue
+                            opt = optimizer_dict.get(p)
+                            if opt is None:
+                                logger.warning(f"No optimizer object for parameter {k}; skipping")
+                                continue
+                            try:
+                                opt.load_state_dict(state)
+                            except Exception as e:
+                                logger.warning(f"Failed loading optimizer state for {k}: {e}")
+
+                if scheduler is not None and "scheduler" in ckpt and ckpt.get("scheduler") is not None:
+                    try:
+                        scheduler.load_state_dict(ckpt["scheduler"])
+                        scheduler_loaded = True
+                    except Exception as e:
+                        logger.warning(f"Failed to load scheduler state: {e}")
+
+                # If we didn't restore scheduler state but we have an update_step, advance scheduler to match update count
+                if scheduler is not None and (not locals().get("scheduler_loaded", False)) and update_step > 0:
+                    try:
+                        for _ in range(update_step):
+                            scheduler.step()
+                    except Exception:
+                        logger.warning("Failed to advance scheduler by update_step; skipping incremental stepping")
+
+                # Restore RNG sidecar if requested
+                try:
+                    if getattr(args, "restore_rng", False):
+                        rng_pt = os.path.join(args.continue_from, "rng_state.pt")
+                        if os.path.exists(rng_pt):
+                            try:
+                                r = torch.load(rng_pt, map_location="cpu")
+                                if r.get("torch_cpu") is not None:
+                                    torch.set_rng_state(r["torch_cpu"])
+                                if torch.cuda.is_available() and r.get("torch_cuda_all") is not None:
+                                    torch.cuda.set_rng_state_all(r["torch_cuda_all"])
+                                if r.get("numpy") is not None:
+                                    np.random.set_state(r["numpy"])
+                                if r.get("python") is not None:
+                                    random.setstate(r["python"])
+                                logger.info("Restored RNG state from rng_state.pt sidecar")
+                            except Exception as e:
+                                logger.warning(f"Failed to restore RNG sidecar: {e}")
+                except Exception:
+                    pass
+
+                logger.info("Loaded optimizer and scheduler state from checkpoint (if present)")
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer/scheduler state: {e}")
+
+    # Optionally save immediately on resume so the user sees a checkpoint at the
+    # restored update_step (only on rank 0). Skip update_step==0 because an
+    # initial checkpoint is already saved earlier.
+    try:
+        if args.continue_from is not None and global_rank == 0 and update_step > 0 and (update_step % args.save_every == 0):
+            logger.info(f"Saving checkpoint on resume at update step {update_step}")
+            save_model_and_tokenizer_checkpoint(
+                args=args,
+                model=model,
+                tokenizer=tokenizer,
+                run_config=run_config,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                update_step=update_step,
+                global_step=global_step,
+                tokens_seen=tokens_seen,
+                tokens_seen_before=tokens_seen_before,
+                update_time=update_time,
+                layer_wise_flag=layer_wise_flag,
+                optimizer_dict=optimizer_dict,
+                wandb_run=wandb_run,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to write resume checkpoint: {e}")
 
 
     # get ready for distributed training
@@ -810,9 +1231,6 @@ def main(args):
         )
 
     # global steps and others are defined above
-    pad_idx = tokenizer.pad_token_id
-    update_time = time.time()
-    local_step = 0  # when continue_from is used, local_step != global_step
 
     # print params and trainable params
     logger.info(f"\n{model}\n")
@@ -843,74 +1261,54 @@ def main(args):
             skip_if_exists=True,
         )
 
-    # ##############################
-    # TRAINING LOOP
-    # we'll never go through all the data, so no need for epochs
-    # ##############################
-
-    # accumulator for micro (per-microstep) loss used for GA averaging/logging
-    micro_loss_sum = 0.0
-
-    for batch_idx, batch in enumerate(dataloader):
-
-        global_step += 1
-        local_step += 1
-
-        if update_step >= args.num_training_steps:
-            logger.info(f"Reached max number of update steps ({args.num_training_steps}). Stopping training.")
-            print(f"Rank {global_rank} stopping training.")
-            break
-
-        batch = {k: v.to(device) for k, v in batch.items()}
-        labels = batch["input_ids"].clone()
-        labels[labels == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
-
-        loss = model(**batch, labels=labels).loss
-        # accumulate raw microstep loss for GA averaging (for logging)
-        micro_loss_sum += loss.item()
-
-        scaled_loss = loss / args.gradient_accumulation
-        scaled_loss.backward()
-
-        if global_step % args.gradient_accumulation != 0:
-            continue
-
-        # At update boundary: compute averaged update loss
-        update_loss = micro_loss_sum / float(args.gradient_accumulation)
-        micro_loss_sum = 0.0
-
-        # compute and optionally clip grad norm (returns norm)
-        if args.grad_clipping != 0.0:
-            try:
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping))
-            except Exception:
-                grad_norm = None
+    # -------------------------
+    # TRAINING LOOP(S)
+    # -------------------------
+    pad_idx = tokenizer.pad_token_id
+    # Initialize update_time so throughput immediately after resume doesn't spike.
+    try:
+        if saved_update_time and saved_update_time > 0:
+            # Try to initialize so the first measured delta approximates the last saved update_time
+            update_time = time.time() - float(saved_update_time)
         else:
-            # compute norm without clipping
-            total_norm = 0.0
-            for p in trainable_params:
-                if p.grad is not None:
-                    try:
-                        param_norm = p.grad.data.norm(2).item()
-                    except Exception:
-                        param_norm = 0.0
-                    total_norm += param_norm ** 2
-            grad_norm = total_norm ** 0.5
+            update_time = time.time()
+    except Exception:
+        update_time = time.time()
+    local_step = 0
+    micro_loss_sum = 0.0
+    epoch_idx = 0
+    epoch_start_tokens = 0  # for virtual epochs by tokens
 
-        if global_rank == 0:
-            pbar.update(1)
+    # helper to run end-of-epoch hooks
+    def _maybe_epoch_hooks():
+        nonlocal epoch_idx, epoch_start_tokens
+        did_epoch = False
 
-        if not layer_wise_flag:
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+        # Virtual epoch by tokens (works in streaming or non-streaming)
+        if args.tokens_per_epoch is not None:
+            if (tokens_seen - epoch_start_tokens) >= args.tokens_per_epoch:
+                epoch_idx += 1
+                epoch_start_tokens = tokens_seen
+                logger.info(f"Reached end of epoch {epoch_idx} (~{args.tokens_per_epoch} tokens)")
+                did_epoch = True
 
-        update_step += 1
-        update_time = time.time() - update_time
-        # save checkpoint by save_every
-        if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-            logger.info(f"Saving checkpoint at update step {update_step}")
+        # True epoch hook: in non-streaming + num_epochs mode, we bump epoch_idx in the outer loop
+        # and call hooks at the end of each outer epoch as well (below).
+        if did_epoch and args.eval_each_epoch:
+            total_loss, evaluated_on_tokens = evaluate_model(
+                args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+            )
+            if global_rank == 0:
+                wandb.log({
+                    "update_step": update_step,
+                    "epoch": epoch_idx,
+                    "eval/loss": total_loss,
+                    "eval/ppl": float(np.exp(min(20, total_loss))),
+                    "eval/tokens": evaluated_on_tokens,
+                }, step=update_step)
+
+        if did_epoch and args.save_each_epoch and global_rank == 0:
+            logger.info(f"Saving checkpoint at end of epoch {epoch_idx}")
             save_model_and_tokenizer_checkpoint(
                 args=args,
                 model=model,
@@ -928,41 +1326,314 @@ def main(args):
                 wandb_run=wandb_run,
             )
 
-        # evaluation
-        if update_step % args.eval_every == 0:
-            logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens = evaluate_model(
-                args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
-            )
-            if global_rank == 0:
-                wandb.log({
-                    "update_step": update_step,
-                    "eval/loss": total_loss,
-                    "eval/ppl": float(np.exp(min(20, total_loss))),
-                    "eval/tokens": evaluated_on_tokens,
-                    },
-                    step=update_step,
+    # Choose loop style
+    if (not args.streaming) and (args.num_epochs is not None):
+        # ---- TRUE EPOCHS ----
+        assert hasattr(dataloader, "__iter__"), "Non-streaming dataloader expected to be finite/iterable per epoch."
+        for epoch in range(args.num_epochs):
+            # important for DDP shuffling
+            if (not args.single_gpu) and hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
+                dataloader.sampler.set_epoch(epoch)
+            logger.info(f"Starting epoch {epoch+1}/{args.num_epochs}")
+
+            for batch_idx, batch in enumerate(dataloader):
+                global_step += 1
+                local_step += 1
+
+                if update_step >= args.num_training_steps:
+                    logger.info(f"Reached max number of update steps ({args.num_training_steps}). Stopping training.")
+                    print(f"Rank {global_rank} stopping training.")
+                    break
+
+                batch = {k: v.to(device) for k, v in batch.items()}
+                labels = batch["input_ids"].clone()
+                labels[labels == pad_idx] = -100
+                tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+                # Honor max_train_tokens cap (stop early if reached)
+                if args.max_train_tokens is not None and tokens_seen >= args.max_train_tokens:
+                    logger.info(f"Reached max_train_tokens={args.max_train_tokens}. Stopping training.")
+                    break
+
+                # compute loss
+                loss = model(**batch, labels=labels).loss
+
+                # ---- token-weighted accumulation across GA microsteps ----
+                valid_tokens = (labels != -100).sum()
+                # accumulate *on CPU as floats* to avoid dtype surprises
+                if 'sum_loss_tok' not in locals():
+                    sum_loss_tok = 0.0
+                    sum_tokens_tok = 0.0
+                sum_loss_tok += float(loss.detach()) * float(valid_tokens.item())
+                sum_tokens_tok += float(valid_tokens.item())
+
+                # backprop (still per-microstep)
+                scaled_loss = loss / args.gradient_accumulation
+                scaled_loss.backward()
+
+                # wait until GA boundary
+                if global_step % args.gradient_accumulation != 0:
+                    continue
+
+                # ---- form local token-weighted mean, then DDP-reduce to global ----
+                update_loss_global = ddp_token_weighted_avg(
+                    sum_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
                 )
-            logger.info(f"Eval loss at step {update_step}: {total_loss}")
 
-        if not layer_wise_flag:
-            lr = optimizer.param_groups[0]["lr"]
-        else:
-            lr = list(optimizer_dict.values())[0].param_groups[0]["lr"]
-        tokens_in_update = tokens_seen - tokens_seen_before
-        tokens_seen_before = tokens_seen
-        batches_in_update = args.gradient_accumulation * world_size
+                # reset accumulators for next update
+                sum_loss_tok = 0.0
+                sum_tokens_tok = 0.0
 
-        if global_rank == 0:
-            throughput_examples = (
-                args.total_batch_size if args.total_batch_size is not None else args.batch_size * args.gradient_accumulation * world_size
-            ) / max(1e-9, update_time)
-            # log namespaced metrics at update granularity
-            if update_step % LOG_EVERY == 0:
+                if args.grad_clipping != 0.0:
+                    try:
+                        grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping))
+                    except Exception:
+                        grad_norm = None
+                else:
+                    total_norm = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            try:
+                                param_norm = p.grad.data.norm(2).item()
+                            except Exception:
+                                param_norm = 0.0
+                            total_norm += param_norm ** 2
+                    grad_norm = total_norm ** 0.5
+
+                if global_rank == 0:
+                    pbar.update(1)
+
+                if not layer_wise_flag:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                update_step += 1
+                update_time = time.time() - update_time
+
+                if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+                    logger.info(f"Saving checkpoint at update step {update_step}")
+                    save_model_and_tokenizer_checkpoint(
+                        args=args,
+                        model=model,
+                        tokenizer=tokenizer,
+                        run_config=run_config,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        update_step=update_step,
+                        global_step=global_step,
+                        tokens_seen=tokens_seen,
+                        tokens_seen_before=tokens_seen_before,
+                        update_time=update_time,
+                        layer_wise_flag=layer_wise_flag,
+                        optimizer_dict=optimizer_dict,
+                        wandb_run=wandb_run,
+                    )
+
+                if update_step % args.eval_every == 0:
+                    logger.info(f"Performing evaluation at step {update_step}")
+                    total_loss, evaluated_on_tokens = evaluate_model(
+                        args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                    )
+                    if global_rank == 0:
+                        wandb.log({
+                            "update_step": update_step,
+                            "eval/loss": total_loss,
+                            "eval/ppl": float(np.exp(min(20, total_loss))),
+                            "eval/tokens": evaluated_on_tokens,
+                        }, step=update_step)
+                    logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
+                lr = (optimizer.param_groups[0]["lr"]
+                      if not layer_wise_flag else list(optimizer_dict.values())[0].param_groups[0]["lr"])
+                tokens_in_update = tokens_seen - tokens_seen_before
+                tokens_seen_before = tokens_seen
+                batches_in_update = args.gradient_accumulation * world_size
+
+                if global_rank == 0 and update_step % LOG_EVERY == 0:
+                    throughput_examples = (
+                        args.total_batch_size if args.total_batch_size is not None
+                        else args.batch_size * args.gradient_accumulation * world_size
+                    ) / max(1e-9, update_time)
+                    wandb.log({
+                        "update_step": update_step,
+                        "train/loss": float(update_loss_global),
+                        "train/ppl": float(np.exp(min(20, update_loss_global))),
+                        "train/lr": lr,
+                        "train/tokens_seen": tokens_seen,
+                        "train/throughput_tokens_s": tokens_in_update / max(1e-9, update_time),
+                        "train/throughput_examples_s": throughput_examples,
+                        "train/throughput_batches_s": batches_in_update / max(1e-9, update_time),
+                        "train/grad_norm": grad_norm,
+                        "sys/gpu_mem_alloc_MB": torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
+                        "sys/gpu_mem_reserved_MB": torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else None,
+                        "sys/gpu_max_alloc_MB": torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
+                    }, step=update_step)
+
+                update_time = time.time()
+
+                # token-based virtual epoch boundary (optional in non-streaming)
+                _maybe_epoch_hooks()
+
+            # end of a TRUE epoch
+            epoch_idx += 1
+            if args.eval_each_epoch:
+                total_loss, evaluated_on_tokens = evaluate_model(
+                    args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                )
+                if global_rank == 0:
+                    wandb.log({
+                        "update_step": update_step,
+                        "epoch": epoch_idx,
+                        "eval/loss": total_loss,
+                        "eval/ppl": float(np.exp(min(20, total_loss))),
+                        "eval/tokens": evaluated_on_tokens,
+                    }, step=update_step)
+            if args.save_each_epoch and global_rank == 0:
+                logger.info(f"Saving checkpoint at end of epoch {epoch_idx}")
+                save_model_and_tokenizer_checkpoint(
+                    args=args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    run_config=run_config,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    update_step=update_step,
+                    global_step=global_step,
+                    tokens_seen=tokens_seen,
+                    tokens_seen_before=tokens_seen_before,
+                    update_time=update_time,
+                    layer_wise_flag=layer_wise_flag,
+                    optimizer_dict=optimizer_dict,
+                    wandb_run=wandb_run,
+                )
+
+            if update_step >= args.num_training_steps:
+                break
+
+    else:
+        # ---- ORIGINAL STEP-BOUND LOOP (streaming or single finite pass) ----
+        for batch_idx, batch in enumerate(dataloader):
+            global_step += 1
+            local_step += 1
+
+            if update_step >= args.num_training_steps:
+                logger.info(f"Reached max number of update steps ({args.num_training_steps}). Stopping training.")
+                print(f"Rank {global_rank} stopping training.")
+                break
+
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch["input_ids"].clone()
+            labels[labels == pad_idx] = -100
+            tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+
+            # Honor max_train_tokens cap (stop early if reached)
+            if args.max_train_tokens is not None and tokens_seen >= args.max_train_tokens:
+                logger.info(f"Reached max_train_tokens={args.max_train_tokens}. Stopping training.")
+                break
+
+            # compute loss
+            loss = model(**batch, labels=labels).loss
+
+            # ---- token-weighted accumulation across GA microsteps ----
+            valid_tokens = (labels != -100).sum()
+            if 'sum_loss_tok' not in locals():
+                sum_loss_tok = 0.0
+                sum_tokens_tok = 0.0
+            sum_loss_tok += float(loss.detach()) * float(valid_tokens.item())
+            sum_tokens_tok += float(valid_tokens.item())
+
+            # backprop (still per-microstep)
+            scaled_loss = loss / args.gradient_accumulation
+            scaled_loss.backward()
+
+            if global_step % args.gradient_accumulation != 0:
+                continue
+
+            # ---- form local token-weighted mean, then DDP-reduce to global ----
+            update_loss_global = ddp_token_weighted_avg(
+                sum_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
+            )
+
+            # reset accumulators for next update
+            sum_loss_tok = 0.0
+            sum_tokens_tok = 0.0
+
+            if args.grad_clipping != 0.0:
+                try:
+                    grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping))
+                except Exception:
+                    grad_norm = None
+            else:
+                total_norm = 0.0
+                for p in trainable_params:
+                    if p.grad is not None:
+                        try:
+                            param_norm = p.grad.data.norm(2).item()
+                        except Exception:
+                            param_norm = 0.0
+                        total_norm += param_norm ** 2
+                grad_norm = total_norm ** 0.5
+
+            if global_rank == 0:
+                pbar.update(1)
+
+            if not layer_wise_flag:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            update_step += 1
+            update_time = time.time() - update_time
+
+            if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+                logger.info(f"Saving checkpoint at update step {update_step}")
+                save_model_and_tokenizer_checkpoint(
+                    args=args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    run_config=run_config,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    update_step=update_step,
+                    global_step=global_step,
+                    tokens_seen=tokens_seen,
+                    tokens_seen_before=tokens_seen_before,
+                    update_time=update_time,
+                    layer_wise_flag=layer_wise_flag,
+                    optimizer_dict=optimizer_dict,
+                    wandb_run=wandb_run,
+                )
+
+            if update_step % args.eval_every == 0:
+                logger.info(f"Performing evaluation at step {update_step}")
+                total_loss, evaluated_on_tokens = evaluate_model(
+                    args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                )
+                if global_rank == 0:
+                    wandb.log({
+                        "update_step": update_step,
+                        "eval/loss": total_loss,
+                        "eval/ppl": float(np.exp(min(20, total_loss))),
+                        "eval/tokens": evaluated_on_tokens,
+                    }, step=update_step)
+                logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
+            lr = (optimizer.param_groups[0]["lr"]
+                  if not layer_wise_flag else list(optimizer_dict.values())[0].param_groups[0]["lr"])
+            tokens_in_update = tokens_seen - tokens_seen_before
+            tokens_seen_before = tokens_seen
+            batches_in_update = args.gradient_accumulation * world_size
+
+            if global_rank == 0 and update_step % LOG_EVERY == 0:
+                throughput_examples = (
+                    args.total_batch_size if args.total_batch_size is not None
+                    else args.batch_size * args.gradient_accumulation * world_size
+                ) / max(1e-9, update_time)
                 wandb.log({
                     "update_step": update_step,
-                    "train/loss": float(update_loss),
-                    "train/ppl": float(np.exp(min(20, update_loss))),
+                    "train/loss": float(update_loss_global),
+                    "train/ppl": float(np.exp(min(20, update_loss_global))),
                     "train/lr": lr,
                     "train/tokens_seen": tokens_seen,
                     "train/throughput_tokens_s": tokens_in_update / max(1e-9, update_time),
@@ -972,10 +1643,10 @@ def main(args):
                     "sys/gpu_mem_alloc_MB": torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
                     "sys/gpu_mem_reserved_MB": torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else None,
                     "sys/gpu_max_alloc_MB": torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
-                    },
-                    step=update_step,
-                )
-        update_time = time.time()
+                }, step=update_step)
+
+            update_time = time.time()
+            _maybe_epoch_hooks()
     # ##############################
     # END of training loop
     # ##############################
@@ -1005,7 +1676,10 @@ def main(args):
     # Final evaluation
     logger.info("Running final evaluation")
     model.eval()
-    del loss, optimizer, scheduler
+    try:
+        del optimizer, scheduler
+    except Exception:
+        pass
     import gc; gc.collect()
     torch.cuda.empty_cache()
 

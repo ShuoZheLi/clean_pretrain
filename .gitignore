@@ -167,3 +167,6 @@ assets/
 /.locks
 **.json**
 **.safetensors**
+
+# checkpoints
+/checkpoints

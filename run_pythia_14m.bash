@@ -14,8 +14,9 @@ lr=0.0001
 min_lr_ratio=0.1
 scheduler="cosine"
 warmup_steps=1000
-num_training_steps=4_00_00
-# max_train_tokens=1000000000
+num_training_steps=none
+max_train_tokens=6_000_000_000
+max_length=256
 
 # training parameters
 
@@ -26,14 +27,15 @@ num_training_steps=4_00_00
 # 1 sec 1 step
 CUDA_VISIBLE_DEVICES=0,1,2,3
 WORLD_SIZE=4
-batch_size=64
+batch_size=256
 gradient_accumulation=2
-total_batch_size=512
-
-# model
-model_config="/nfs/shuozhe/saved_model/Qwen2.5-0.5B"
+total_batch_size=2048
+model_config="EleutherAI/pythia-14m"
 continue_from=none
 reinit_params=True
+# model_config="/nfs/shuozhe/clean_pretrain/checkpoints/test_load/pythia-14m-SlimPajama-6B/model_20"
+# continue_from="/nfs/shuozhe/clean_pretrain/checkpoints/test_load/pythia-14m-SlimPajama-6B/model_20"
+# reinit_params=False
 reinit_scope="all"  # options: all, embeddings, none
 seed=42
 
@@ -44,11 +46,8 @@ dtype="bfloat16"
 activation_checkpointing=True
 
 # dataset
-# dataset="allenai/c4"
-# dataset_config="en"
-dataset="/nfs/shuozhe/saved_dataset/small-c4-dataset"
-dataset_config="default"  # use None for no config
-
+dataset="DKYoon/SlimPajama-6B"
+dataset_config="default"
 
 # log and eval
 project_name="pretrain"
@@ -57,6 +56,8 @@ wandb_run_name="pythia-14m-SlimPajama-6B"
 save_dir="./checkpoints/pythia-14m-SlimPajama-6B"
 save_every=2000
 eval_every=1000
+# save_every=10
+# eval_every=10
 
 export WORLD_SIZE=$WORLD_SIZE # total number of processes
 export CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
@@ -81,6 +82,7 @@ torchrun --standalone --nproc_per_node $nproc_per_node pretrain.py \
         --scheduler $scheduler \
         --warmup_steps $warmup_steps \
         --num_training_steps $num_training_steps \
+        --max_train_tokens $max_train_tokens \
         --min_lr_ratio $min_lr_ratio \
         --reinit_params $reinit_params \
         --reinit_scope $reinit_scope \
