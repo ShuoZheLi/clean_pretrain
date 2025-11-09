@@ -10,7 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 # Data utilities
 # ----------------------------
 
-TINY_SHAKES_URL = "https://raw.githubusercontent.com/karpathy/char-RNN/master/data/tinyshakespeare/input.txt"
+# TINY_SHAKES_URL = "https://raw.githubusercontent.com/karpathy/char-RNN/master/data/tinyshakespeare/input.txt"
+TINY_SHAKES_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-train.txt"
 
 def try_download_tiny_shakespeare(path):
     try:
@@ -306,6 +307,7 @@ class Config:
     mix_q_ce: float = 0.0  # weight on Q loss when mixing with CE: total = mix_q_ce * L_q + (1-mix_q_ce) * L_ce
     q_neg_samples: int = 0    # number of negative tokens to sample per position (0 = use full vocab)
     use_q_head: bool = False  # whether to use a separate Q head (recommended)
+    ce_head_only: bool = False
 
 def evaluate(model, dataset, device, eval_tokens=20000):
     model.eval()
@@ -396,13 +398,16 @@ def main():
     parser.add_argument("--mix_q_ce", type=float, default=0.0, help="Mix weight for Q-loss vs CE (0 -> CE only)")
     parser.add_argument("--q_neg_samples", type=int, default=0, help="Negatives to sample per position (0 = full vocab)")
     parser.add_argument("--use_q_head", action="store_true", help="Add a separate Q head (value head) instead of reusing logits")
+    parser.add_argument("--ce_head_only", action="store_true",
+                        help="When objective=='q_reg', make CE loss update only model.head (detach hidden).")
     args = parser.parse_args()
 
     cfg = Config(block_size=args.block_size, batch_size=args.batch_size, n_layer=args.n_layer,
                  n_head=args.n_head, n_embd=args.n_embd, lr=args.lr, max_iters=args.max_iters,
                  compile=args.compile, objective=args.objective, checkpoint_dir=args.checkpoint_dir,
                  distract_p=args.distract_p, distract_alphabet=args.distract_alphabet, distract_mode=args.distract_mode,
-                 gamma=args.gamma, mix_q_ce=args.mix_q_ce, q_neg_samples=args.q_neg_samples, use_q_head=args.use_q_head)
+                 gamma=args.gamma, mix_q_ce=args.mix_q_ce, q_neg_samples=args.q_neg_samples, use_q_head=args.use_q_head,
+                 ce_head_only=args.ce_head_only)
 
     torch.manual_seed(cfg.seed); random.seed(cfg.seed)
 
@@ -509,10 +514,19 @@ def main():
                     Q_targets.scatter_(dim=-1, index=Y.unsqueeze(-1), src=V_targets_exp)
                     loss_q = 0.5 * (q_pred - Q_targets).pow(2).mean()
 
-                # --- CHANGE: always compute CE for logging (and mixing if enabled) ---
-                loss_ce = F.cross_entropy(logits.view(-1, vocab_size), Y.view(-1))
+                # CE path: optionally block gradients to backbone so only model.head updates
+                if cfg.ce_head_only:
+                    # detach hidden so gradients flow only into model.head
+                    logits_ce = model.head(hidden.detach())
+                else:
+                    # normal CE uses full logits (backbone receives grads)
+                    logits_ce = logits
+                loss_ce = F.cross_entropy(logits_ce.view(-1, vocab_size), Y.view(-1))
                 if cfg.mix_q_ce and cfg.mix_q_ce > 0.0:
-                    loss = cfg.mix_q_ce * loss_q + (1.0 - cfg.mix_q_ce) * loss_ce
+                    if cfg.ce_head_only:
+                        loss = loss_q + loss_ce
+                    else:
+                        loss = cfg.mix_q_ce * loss_q + (1.0 - cfg.mix_q_ce) * loss_ce
                 else:
                     loss = loss_q
 
