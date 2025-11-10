@@ -730,21 +730,34 @@ def compute_loss(
 
         # --- Always compute CE (NTP) for logging, even if mix_q_ce == 0 ---
         if args.ce_head_only:
+            # head-only CE: run detached last hidden through final norm (if present)
+            # then through lm_head so only lm_head (and any head-only params) get gradients.
             lm_head = base_model.get_output_embeddings()   # nn.Linear-like
-            try:
-                lm_weight = getattr(lm_head, "weight", None)
-                hl = hidden_last.detach()
-                if lm_weight is not None and hl.dtype != lm_weight.dtype:
-                    hl = hl.to(lm_weight.dtype)
-                logits_ce = lm_head(hl)
-            except Exception:
-                logits_ce = lm_head(hidden_last.detach())
+
+            # Qwen2 layout: final norm lives at base_model.model.norm (fall back to base_model.norm)
+            final_norm = getattr(getattr(base_model, "model", base_model), "norm", None)
+
+            hl = hidden_last.detach()
+            if final_norm is not None:
+                # apply final norm without grad to avoid changing base model
+                hl = final_norm(hl)
+
+            # ensure dtype matches lm_head weights (important for bf16/fp16)
+            lm_w = getattr(lm_head, "weight", None)
+            if lm_w is not None and hl.dtype != lm_w.dtype:
+                hl = hl.to(lm_w.dtype)
+
+            logits_ce = lm_head(hl)
         else:
             logits_ce = logits
 
+        # causal shift: next-token CE compares logits[:, :-1] with labels[:, 1:]
+        logits_shift = logits_ce[:, :-1, :].contiguous()
+        labels_shift = labels[:, 1:].contiguous()
+
         loss_ce = torch.nn.functional.cross_entropy(
-            logits_ce.view(-1, logits_ce.size(-1)),
-            labels.view(-1),
+            logits_shift.view(-1, logits_shift.size(-1)),
+            labels_shift.view(-1),
             ignore_index=-100,
         )
 
@@ -1738,6 +1751,7 @@ def main(args):
                     if args.objective == "q_reg":
                         logdict["train/q_loss"] = float(q_loss_global)
                         logdict["train/ntp_loss"] = float(ntp_loss_global)
+                        logdict["train/loss"] = logdict["train/q_loss"] + logdict["train/ntp_loss"]
 
                     wandb.log(logdict, step=update_step)
 
@@ -1783,171 +1797,169 @@ def main(args):
                 break
 
     else:
-        # ---- ORIGINAL STEP-BOUND LOOP (streaming or single finite pass) ----
-        for batch_idx, batch in enumerate(dataloader):
-            global_step += 1
-            local_step += 1
+        # ---- STEP-BOUND LOOP ----
+        # For streaming datasets, re-iterate the dataloader until we hit the cap(s).
+        # For non-streaming, behavior remains single pass.
+        while update_step < args.num_training_steps and (args.max_train_tokens is None or tokens_seen < args.max_train_tokens):
+            for batch_idx, batch in enumerate(dataloader):
+                # === existing body starts ===
+                global_step += 1
+                local_step += 1
 
-            if update_step >= args.num_training_steps:
-                logger.info(f"Reached max number of update steps ({args.num_training_steps}). Stopping training.")
-                print(f"Rank {global_rank} stopping training.")
-                break
+                if update_step >= args.num_training_steps:
+                    logger.info(f"Reached max number of update steps ({args.num_training_steps}). Stopping training.")
+                    print(f"Rank {global_rank} stopping training.")
+                    break
 
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
-            tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+                batch = {k: v.to(device) for k, v in batch.items()}
+                labels = batch["input_ids"].clone()
+                labels[labels == pad_idx] = -100
+                tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-            # Honor max_train_tokens cap (stop early if reached)
-            if args.max_train_tokens is not None and tokens_seen >= args.max_train_tokens:
-                logger.info(f"Reached max_train_tokens={args.max_train_tokens}. Stopping training.")
-                break
+                if args.max_train_tokens is not None and tokens_seen >= args.max_train_tokens:
+                    logger.info(f"Reached max_train_tokens={args.max_train_tokens}. Stopping training.")
+                    break
 
-            # compute loss (supports nll or q_reg objectives)
-            loss, loss_parts = compute_loss(args, model, batch, labels)
+                # --- keep the rest of your existing inner loop body unchanged ---
+                loss, loss_parts = compute_loss(args, model, batch, labels)
+                valid_tokens = (labels != -100).sum()
+                if 'sum_loss_tok' not in locals():
+                    sum_loss_tok = 0.0
+                    sum_tokens_tok = 0.0
+                sum_loss_tok += float(loss.detach()) * float(valid_tokens.item())
+                sum_tokens_tok += float(valid_tokens.item())
 
-            # ---- token-weighted accumulation across GA microsteps ----
-            valid_tokens = (labels != -100).sum()
-            if 'sum_loss_tok' not in locals():
+                if args.objective == "q_reg":
+                    if 'sum_q_loss_tok' not in locals():
+                        sum_q_loss_tok = 0.0
+                        sum_ntp_loss_tok = 0.0
+                    if "q_loss" in loss_parts and loss_parts["q_loss"] is not None:
+                        sum_q_loss_tok += float(loss_parts["q_loss"].detach()) * float(valid_tokens.item())
+                    if "ntp_loss" in loss_parts and loss_parts["ntp_loss"] is not None:
+                        sum_ntp_loss_tok += float(loss_parts["ntp_loss"].detach()) * float(valid_tokens.item())
+
+                scaled_loss = loss / args.gradient_accumulation
+                scaled_loss.backward()
+
+                if global_step % args.gradient_accumulation != 0:
+                    continue
+
+                update_loss_global = ddp_token_weighted_avg(
+                    sum_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
+                )
+                if args.objective == "q_reg":
+                    q_loss_global = ddp_token_weighted_avg(sum_q_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu)
+                    ntp_loss_global = ddp_token_weighted_avg(sum_ntp_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu)
+
                 sum_loss_tok = 0.0
                 sum_tokens_tok = 0.0
-            sum_loss_tok += float(loss.detach()) * float(valid_tokens.item())
-            sum_tokens_tok += float(valid_tokens.item())
-
-            # NEW: part-wise accumulators for q_reg
-            if args.objective == "q_reg":
-                if 'sum_q_loss_tok' not in locals():
+                if args.objective == "q_reg":
                     sum_q_loss_tok = 0.0
                     sum_ntp_loss_tok = 0.0
-                if "q_loss" in loss_parts and loss_parts["q_loss"] is not None:
-                    sum_q_loss_tok += float(loss_parts["q_loss"].detach()) * float(valid_tokens.item())
-                if "ntp_loss" in loss_parts and loss_parts["ntp_loss"] is not None:
-                    sum_ntp_loss_tok += float(loss_parts["ntp_loss"].detach()) * float(valid_tokens.item())
 
-            # backprop (still per-microstep)
-            scaled_loss = loss / args.gradient_accumulation
-            scaled_loss.backward()
+                if args.grad_clipping != 0.0:
+                    try:
+                        grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping))
+                    except Exception:
+                        grad_norm = None
+                else:
+                    total_norm = 0.0
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            try:
+                                param_norm = p.grad.data.norm(2).item()
+                            except Exception:
+                                param_norm = 0.0
+                            total_norm += param_norm ** 2
+                    grad_norm = total_norm ** 0.5
 
-            if global_step % args.gradient_accumulation != 0:
-                continue
-
-            # ---- form local token-weighted mean, then DDP-reduce to global ----
-            update_loss_global = ddp_token_weighted_avg(
-                sum_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
-            )
-
-            # NEW: part-wise global reduces for q_reg
-            if args.objective == "q_reg":
-                q_loss_global = ddp_token_weighted_avg(
-                    sum_q_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
-                )
-                ntp_loss_global = ddp_token_weighted_avg(
-                    sum_ntp_loss_tok, sum_tokens_tok, device=device, single_gpu=args.single_gpu
-                )
-
-            # reset accumulators for next update
-            sum_loss_tok = 0.0
-            sum_tokens_tok = 0.0
-            if args.objective == "q_reg":
-                sum_q_loss_tok = 0.0
-                sum_ntp_loss_tok = 0.0
-
-            if args.grad_clipping != 0.0:
-                try:
-                    grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping))
-                except Exception:
-                    grad_norm = None
-            else:
-                total_norm = 0.0
-                for p in trainable_params:
-                    if p.grad is not None:
-                        try:
-                            param_norm = p.grad.data.norm(2).item()
-                        except Exception:
-                            param_norm = 0.0
-                        total_norm += param_norm ** 2
-                grad_norm = total_norm ** 0.5
-
-            if global_rank == 0:
-                pbar.update(1)
-
-            if not layer_wise_flag:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-            update_step += 1
-            update_time = time.time() - update_time
-
-            if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-                logger.info(f"Saving checkpoint at update step {update_step}")
-                save_model_and_tokenizer_checkpoint(
-                    args=args,
-                    model=model,
-                    tokenizer=tokenizer,
-                    run_config=run_config,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    update_step=update_step,
-                    global_step=global_step,
-                    tokens_seen=tokens_seen,
-                    tokens_seen_before=tokens_seen_before,
-                    update_time=update_time,
-                    layer_wise_flag=layer_wise_flag,
-                    optimizer_dict=optimizer_dict,
-                    wandb_run=wandb_run,
-                )
-
-            if update_step % args.eval_every == 0:
-                logger.info(f"Performing evaluation at step {update_step}")
-                total_loss, evaluated_on_tokens = evaluate_model(
-                    args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
-                )
                 if global_rank == 0:
-                    wandb.log({
+                    pbar.update(1)
+
+                if not layer_wise_flag:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                update_step += 1
+                update_time = time.time() - update_time
+
+                if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+                    logger.info(f"Saving checkpoint at update step {update_step}")
+                    save_model_and_tokenizer_checkpoint(
+                        args=args,
+                        model=model,
+                        tokenizer=tokenizer,
+                        run_config=run_config,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        update_step=update_step,
+                        global_step=global_step,
+                        tokens_seen=tokens_seen,
+                        tokens_seen_before=tokens_seen_before,
+                        update_time=update_time,
+                        layer_wise_flag=layer_wise_flag,
+                        optimizer_dict=optimizer_dict,
+                        wandb_run=wandb_run,
+                    )
+
+                if update_step % args.eval_every == 0:
+                    logger.info(f"Performing evaluation at step {update_step}")
+                    total_loss, evaluated_on_tokens = evaluate_model(
+                        args, model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                    )
+                    if global_rank == 0:
+                        wandb.log({
+                            "update_step": update_step,
+                            "eval/loss": total_loss,
+                            "eval/ppl": float(np.exp(min(20, total_loss))),
+                            "eval/tokens": evaluated_on_tokens,
+                        }, step=update_step)
+                    logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
+                lr = (optimizer.param_groups[0]["lr"]
+                      if not layer_wise_flag else list(optimizer_dict.values())[0].param_groups[0]["lr"])
+                tokens_in_update = tokens_seen - tokens_seen_before
+                tokens_seen_before = tokens_seen
+                batches_in_update = args.gradient_accumulation * world_size
+
+                if global_rank == 0 and update_step % LOG_EVERY == 0:
+                    throughput_examples = (
+                        args.total_batch_size if args.total_batch_size is not None
+                        else args.batch_size * args.gradient_accumulation * world_size
+                    ) / max(1e-9, update_time)
+                    logdict = {
                         "update_step": update_step,
-                        "eval/loss": total_loss,
-                        "eval/ppl": float(np.exp(min(20, total_loss))),
-                        "eval/tokens": evaluated_on_tokens,
-                    }, step=update_step)
-                logger.info(f"Eval loss at step {update_step}: {total_loss}")
+                        "train/loss": float(update_loss_global),
+                        "train/ppl": float(np.exp(min(20, update_loss_global))),
+                        "train/lr": lr,
+                        "train/tokens_seen": tokens_seen,
+                        "train/throughput_tokens_s": tokens_in_update / max(1e-9, update_time),
+                        "train/throughput_examples_s": throughput_examples,
+                        "train/throughput_batches_s": batches_in_update / max(1e-9, update_time),
+                        "train/grad_norm": grad_norm,
+                        "sys/gpu_mem_alloc_MB": torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
+                        "sys/gpu_mem_reserved_MB": torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else None,
+                        "sys/gpu_max_alloc_MB": torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
+                    }
+                    if args.objective == "q_reg":
+                        logdict["train/q_loss"] = float(q_loss_global)
+                        logdict["train/ntp_loss"] = float(ntp_loss_global)
+                        # keep "train/loss" as you already had (optional):
+                        logdict["train/loss"] = logdict["train/q_loss"] + logdict["train/ntp_loss"]
+                    wandb.log(logdict, step=update_step)
 
-            lr = (optimizer.param_groups[0]["lr"]
-                  if not layer_wise_flag else list(optimizer_dict.values())[0].param_groups[0]["lr"])
-            tokens_in_update = tokens_seen - tokens_seen_before
-            tokens_seen_before = tokens_seen
-            batches_in_update = args.gradient_accumulation * world_size
+                update_time = time.time()
+                _maybe_epoch_hooks()
+                # === existing inner body ends ===
 
-            if global_rank == 0 and update_step % LOG_EVERY == 0:
-                throughput_examples = (
-                    args.total_batch_size if args.total_batch_size is not None
-                    else args.batch_size * args.gradient_accumulation * world_size
-                ) / max(1e-9, update_time)
-                logdict = {
-                    "update_step": update_step,
-                    "train/loss": float(update_loss_global),
-                    "train/ppl": float(np.exp(min(20, update_loss_global))),
-                    "train/lr": lr,
-                    "train/tokens_seen": tokens_seen,
-                    "train/throughput_tokens_s": tokens_in_update / max(1e-9, update_time),
-                    "train/throughput_examples_s": throughput_examples,
-                    "train/throughput_batches_s": batches_in_update / max(1e-9, update_time),
-                    "train/grad_norm": grad_norm,
-                    "sys/gpu_mem_alloc_MB": torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
-                    "sys/gpu_mem_reserved_MB": torch.cuda.memory_reserved() / (1024 ** 2) if torch.cuda.is_available() else None,
-                    "sys/gpu_max_alloc_MB": torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else None,
-                }
+            # If not streaming, do only one pass (original behavior)
+            if not args.streaming:
+                break
 
-                # NEW: add separated losses for q_reg
-                if args.objective == "q_reg":
-                    logdict["train/q_loss"] = float(q_loss_global)
-                    logdict["train/ntp_loss"] = float(ntp_loss_global)
-                    logdict["train/loss"] = float(q_loss_global + ntp_loss_global)
-
-                wandb.log(logdict, step=update_step)
-
-            update_time = time.time()
-            _maybe_epoch_hooks()
+            # For streaming: we finished one pass but still haven't hit caps.
+            # Just loop again; DataLoader will create a fresh iterator next pass.
+            update_time = time.time()  # avoid huge elapsed time across re-iterations
     # ##############################
     # END of training loop
     # ##############################
